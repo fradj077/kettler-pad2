@@ -12,6 +12,9 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -32,6 +35,7 @@ import android.text.style.RelativeSizeSpan
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.TextView
@@ -92,6 +96,17 @@ class PadService : Service() {
     private var speed = 0.0
     private var wanted = -1.0
     private var retry = 0
+    private var fails = 0
+    private var scanCb: ScanCallback? = null
+    private val reconnectRun = Runnable { connect() }
+    private val timeoutRun = Runnable {
+        if (running && state == "CONNECTING") {
+            fails++
+            closeGatt()
+            setState("OFF", "انتهت مهلة الاتصال — إعادة المحاولة")
+            scheduleReconnect(1500)
+        }
+    }
 
     // ---- GATT operations must run one at a time ----
     private val ops = ArrayDeque<() -> Boolean>()
@@ -140,6 +155,7 @@ class PadService : Service() {
         } catch (e: Exception) {
         }
         ui.removeCallbacksAndMessages(null)
+        stopScan()
         closeGatt()
         removeAllWindows()
         super.onDestroy()
@@ -182,9 +198,16 @@ class PadService : Service() {
         refreshUi()
     }
 
+    private fun scheduleReconnect(ms: Long) {
+        ui.removeCallbacks(reconnectRun)
+        if (running) ui.postDelayed(reconnectRun, ms)
+    }
+
     @SuppressLint("MissingPermission")
     private fun connect() {
         if (!running) return
+        ui.removeCallbacks(reconnectRun)
+        ui.removeCallbacks(timeoutRun)
         val addr = prefs.getString("addr", null)
         if (addr == null) {
             setState("OFF", "لم تُختر مشاية")
@@ -193,13 +216,67 @@ class PadService : Service() {
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (adapter == null || !adapter.isEnabled) {
             setState("OFF", "البلوتوث مغلق")
-            ui.postDelayed({ connect() }, 4000)
+            scheduleReconnect(4000)
             return
         }
         closeGatt()
+        // after several failures the address may have changed: look for the saved name
+        if (fails >= 3 && fails % 3 == 0 && scanCb == null) {
+            findByName(adapter.bluetoothLeScanner)
+        }
         setState("CONNECTING")
         val dev = adapter.getRemoteDevice(addr)
         gatt = dev.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        ui.postDelayed(timeoutRun, 20000)
+    }
+
+    /** Long press on the hub: drop everything and connect again right now. */
+    private fun forceReconnect() {
+        if (!running) return
+        fails = 0
+        stopScan()
+        Toast.makeText(this, "جارٍ الاتصال بالمشاية...", Toast.LENGTH_SHORT).show()
+        connect()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun findByName(scanner: android.bluetooth.le.BluetoothLeScanner?) {
+        val want = prefs.getString("name", null) ?: return
+        if (scanner == null) return
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val nm = result.scanRecord?.deviceName ?: try { result.device.name } catch (e: Exception) { null }
+                if (nm != null && nm.equals(want, ignoreCase = true)) {
+                    val a = result.device.address
+                    ui.post {
+                        stopScan()
+                        if (a != prefs.getString("addr", null)) {
+                            prefs.edit().putString("addr", a).apply()
+                            fails = 0
+                            connect()
+                        }
+                    }
+                }
+            }
+        }
+        scanCb = cb
+        try {
+            scanner.startScan(null, ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), cb)
+            ui.postDelayed({ stopScan() }, 8000)
+        } catch (e: Exception) {
+            scanCb = null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScan() {
+        val cb = scanCb ?: return
+        scanCb = null
+        try {
+            val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+            adapter?.bluetoothLeScanner?.stopScan(cb)
+        } catch (e: Exception) {
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -229,9 +306,11 @@ class PadService : Service() {
                     } catch (e: Exception) {
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    ui.removeCallbacks(timeoutRun)
                     closeGatt()
+                    fails++
                     setState("OFF", "انقطع الاتصال (رمز " + status + ") — إعادة المحاولة")
-                    if (running) ui.postDelayed({ connect() }, 3000)
+                    scheduleReconnect(2000)
                 }
             }
         }
@@ -243,10 +322,15 @@ class PadService : Service() {
                 val c = svc?.getCharacteristic(CP)
                 if (svc == null || c == null) {
                     Toast.makeText(this@PadService, "هذا الجهاز لا يدعم FTMS", Toast.LENGTH_LONG).show()
+                    ui.removeCallbacks(timeoutRun)
                     closeGatt()
+                    fails++
                     setState("OFF", "الجهاز المختار لا يدعم FTMS")
+                    scheduleReconnect(5000)
                     return@post
                 }
+                ui.removeCallbacks(timeoutRun)
+                fails = 0
                 cpChar = c
                 setState("ON")
                 enableCcc(g, c, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
@@ -663,6 +747,19 @@ class PadService : Service() {
         var ox = 0
         var oy = 0
         var moved = false
+        var longFired = false
+        var pendingTap = false
+        val longRun = Runnable {
+            if (!moved) {
+                longFired = true
+                hub.view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                forceReconnect()
+            }
+        }
+        val tapRun = Runnable {
+            pendingTap = false
+            toggle()
+        }
         hub.view.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
@@ -671,12 +768,17 @@ class PadService : Service() {
                     ox = originX
                     oy = originY
                     moved = false
+                    longFired = false
+                    ui.postDelayed(longRun, 600)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - sx
                     val dy = e.rawY - sy
-                    if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) moved = true
+                    if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) {
+                        moved = true
+                        ui.removeCallbacks(longRun)
+                    }
                     if (moved) {
                         originX = ox + dx.toInt()
                         originY = oy + dy.toInt()
@@ -686,7 +788,23 @@ class PadService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) toggle()
+                    ui.removeCallbacks(longRun)
+                    if (!moved && !longFired) {
+                        if (pendingTap) {
+                            // second tap: remove the circle completely
+                            ui.removeCallbacks(tapRun)
+                            pendingTap = false
+                            Toast.makeText(this, "أُغلقت اللوحة", Toast.LENGTH_SHORT).show()
+                            stopSelf()
+                        } else {
+                            pendingTap = true
+                            ui.postDelayed(tapRun, 300)
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    ui.removeCallbacks(longRun)
                     true
                 }
                 else -> false

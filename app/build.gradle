@@ -1,0 +1,25 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'app.kettler.pad'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'app.kettler.pad'
+        minSdk 26
+        targetSdk 34
+        versionCode 2
+        versionName '1.1'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}

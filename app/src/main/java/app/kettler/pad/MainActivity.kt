@@ -16,8 +16,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -36,6 +40,8 @@ class MainActivity : Activity() {
     private var scanning = false
     private var scanCb: ScanCallback? = null
     private val ftms: UUID = UUID.fromString("00001826-0000-1000-8000-00805f9b34fb")
+    private val env: UUID = UUID.fromString("0000181a-0000-1000-8000-00805f9b34fb")
+    private var forTemp = false
 
     private val stateListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "state") ui.post { refreshStatus() }
@@ -70,7 +76,8 @@ class MainActivity : Activity() {
             val m = missing()
             if (m.isEmpty()) toast("الأذونات ممنوحة") else requestPermissions(m.toTypedArray(), 1)
         })
-        root.addView(makeButton("3) البحث عن المشاية واختيارها") { startScan() })
+        root.addView(makeButton("3) البحث عن المشاية واختيارها") { startScan(false) })
+        root.addView(makeButton("3ب) اختيار حساس الحرارة (ESP32)") { startScan(true) })
 
         devices = LinearLayout(this)
         devices.orientation = LinearLayout.VERTICAL
@@ -144,6 +151,33 @@ class MainActivity : Activity() {
         val alphaLabel = TextView(this)
         root.addView(alphaLabel)
         root.addView(makeSeek(alphaLabel, 40, 100, "alpha", 85) { v -> "عتمة الأزرار: " + v + "%" })
+
+        val th = TextView(this)
+        th.text = "حماية حرارة المحرك"
+        th.textSize = 18f
+        th.setPadding(0, pad, 0, 0)
+        root.addView(th)
+        val tl = TextView(this)
+        tl.text = "درجة الخطر بالمئوية (0 = إيقاف الحماية):"
+        root.addView(tl)
+        val et = EditText(this)
+        et.inputType = InputType.TYPE_CLASS_NUMBER
+        et.setText(prefs().getInt("limit", 70).toString())
+        et.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+            override fun afterTextChanged(s: Editable?) {
+                val v = s.toString().toIntOrNull()
+                if (v != null && v in 0..100) prefs().edit().putInt("limit", v).apply()
+            }
+        })
+        root.addView(et)
+        val tip = TextView(this)
+        tip.text = "عند بلوغها: تتوقف المشاية تلقائيًا ويعمل اهتزاز وصوت إنذار، وتُمنع الأوامر حتى تنخفض الحرارة 3 درجات. المس الدائرة العائمة لإسكات الصوت."
+        tip.textSize = 13f
+        root.addView(tip)
     }
 
     private fun makeSeek(label: TextView, min: Int, max: Int, key: String, def: Int, text: (Int) -> String): SeekBar {
@@ -204,12 +238,14 @@ class MainActivity : Activity() {
         sb.append(if (missing().isEmpty()) "✔ الأذونات\n" else "✘ الأذونات\n")
         val name = prefs().getString("name", null)
         if (name != null) sb.append("✔ المشاية: ").append(name).append("\n") else sb.append("✘ المشاية: لم تُختر\n")
+        val tn = prefs().getString("tname", null)
+        if (tn != null) sb.append("✔ حساس الحرارة: ").append(tn).append("\n") else sb.append("— حساس الحرارة: غير مختار (اختياري)\n")
         val st = prefs().getString("state", null)
         if (st != null) sb.append("الحالة: ").append(st)
         status.text = sb.toString()
     }
 
-    private fun startScan() {
+    private fun startScan(temp: Boolean) {
         if (missing().isNotEmpty()) {
             toast("امنح الأذونات أولاً (الزر 2)")
             return
@@ -226,6 +262,7 @@ class MainActivity : Activity() {
             return
         }
         if (scanning) return
+        forTemp = temp
         devices.removeAllViews()
         seen.clear()
         val cb = object : ScanCallback() {
@@ -238,7 +275,7 @@ class MainActivity : Activity() {
                 val uuids = rec?.serviceUuids
                 if (uuids != null) {
                     for (u in uuids) {
-                        if (u.uuid == ftms) isFtms = true
+                        if (u.uuid == (if (forTemp) env else ftms)) isFtms = true
                     }
                 }
                 addDevice(addr, name, isFtms)
@@ -267,10 +304,15 @@ class MainActivity : Activity() {
         val b = Button(this)
         b.text = (if (isFtms) "★ " else "") + shown + "\n" + addr
         b.setOnClickListener {
-            prefs().edit().putString("addr", addr).putString("name", if (name.isEmpty()) addr else name).apply()
+            val nm = if (name.isEmpty()) addr else name
+            if (forTemp) {
+                prefs().edit().putString("taddr", addr).putString("tname", nm).apply()
+            } else {
+                prefs().edit().putString("addr", addr).putString("name", nm).apply()
+            }
             stopScan()
             refreshStatus()
-            toast("اختيرت المشاية")
+            toast(if (forTemp) "اختير حساس الحرارة" else "اختيرت المشاية")
         }
         devices.addView(b, if (isFtms) 0 else devices.childCount)
     }

@@ -74,6 +74,7 @@ class PadService : Service() {
         val pos = ArrayList<IntArray>()      // 14 entries: x, y of buttons 1..14
         var hub = IntArray(3)                // x, y, diameter
         var stop = IntArray(4)               // x, y, w, h
+        var start = IntArray(4)              // x, y, w, h
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -465,6 +466,8 @@ class PadService : Service() {
                     ready = false
                     requestControl()
                     sendSpeed(wanted)
+                } else if (op == 0x07 && res != 0x01) {
+                    updateNote("رفضت المشاية التشغيل (رمز " + res + ")")
                 } else if (op == 0x02) {
                     updateNote("رفضت المشاية السرعة (رمز " + res + ")")
                 }
@@ -482,6 +485,18 @@ class PadService : Service() {
         retry = 0
         if (!ready) requestControl()
         sendSpeed(wanted)
+    }
+
+    // one button: request control (0x00), short pause, then start/resume (0x07)
+    private fun onStart() {
+        if (gatt == null) {
+            Toast.makeText(this, "غير متصل بالمشاية", Toast.LENGTH_SHORT).show()
+            return
+        }
+        requestControl()
+        ui.postDelayed({
+            if (gatt != null) enqueue { writeCp(byteArrayOf(0x07)) }
+        }, 400)
     }
 
     private fun onStop() {
@@ -515,6 +530,12 @@ class PadService : Service() {
         return Color.HSVToColor(alpha, floatArrayOf(hue, 0.85f, 0.9f))
     }
 
+    private fun splitStartStop(lay: Lay, x: Int, y: Int, w: Int, h: Int, gap: Int) {
+        val half = (w - gap) / 2
+        lay.start = intArrayOf(x, y, half, h)
+        lay.stop = intArrayOf(x + half + gap, y, half, h)
+    }
+
     private fun computeLayout(kind: String, d: Int, gap: Int, land: Boolean): Lay {
         if (kind == "frame") {
             val cols = if (land) 5 else 4
@@ -531,18 +552,18 @@ class PadService : Service() {
             val ih = (rows - 2) * d + (rows - 3) * gap
             if (!land) {
                 lay.hub = intArrayOf(step, step, iw)
-                lay.stop = intArrayOf(step, step + iw + gap, iw, ih - iw - gap)
+                splitStartStop(lay, step, step + iw + gap, iw, ih - iw - gap, gap)
             } else {
                 lay.hub = intArrayOf(step, step, ih)
                 val sw = iw - ih - gap
                 val sh = Math.min(d, ih)
-                lay.stop = intArrayOf(step + ih + gap, step + (ih - sh) / 2, sw, sh)
+                splitStartStop(lay, step + ih + gap, step + (ih - sh) / 2, sw, sh, gap)
             }
             return lay
         }
         if (kind == "grid") {
             val cols = if (land) 8 else 2
-            val rows = (16 + cols - 1) / cols
+            val rows = (17 + cols - 1) / cols
             val step = d + gap
             val lay = Lay(cols * d + (cols - 1) * gap, rows * d + (rows - 1) * gap)
             for (i in 0 until 14) {
@@ -550,7 +571,8 @@ class PadService : Service() {
                 lay.pos.add(intArrayOf((idx % cols) * step, (idx / cols) * step))
             }
             lay.hub = intArrayOf(0, 0, d)
-            lay.stop = intArrayOf((15 % cols) * step, (15 / cols) * step, d, d)
+            lay.start = intArrayOf((15 % cols) * step, (15 / cols) * step, d, d)
+            lay.stop = intArrayOf((16 % cols) * step, (16 / cols) * step, d, d)
             return lay
         }
         // ring
@@ -572,7 +594,10 @@ class PadService : Service() {
         val stack = hubD + gap + stopD
         val top = (c - stack / 2.0).toInt()
         lay.hub = intArrayOf((c - hubD / 2.0).toInt(), top, hubD)
-        lay.stop = intArrayOf((c - stopD / 2.0).toInt(), top + hubD + gap, stopD, stopD)
+        val stackHalf = stack / 2.0
+        val chord = 2 * Math.sqrt(Math.max(0.0, innerR * innerR - stackHalf * stackHalf)) * 0.95
+        val rowW = Math.max(stopD.toDouble(), Math.min(2.0 * stopD + gap, chord)).toInt()
+        splitStartStop(lay, (c - rowW / 2.0).toInt(), top + hubD + gap, rowW, stopD, gap)
         return lay
     }
 
@@ -676,6 +701,10 @@ class PadService : Service() {
         stopItm.view.text = "■"
         stopItm.view.setOnClickListener { onStop() }
         items.add(stopItm)
+        val startItm = makeItem(lay.start[0], lay.start[1], lay.start[2], lay.start[3], Color.argb(Math.max(alpha, 200), 30, 150, 70), Math.min(lay.start[2], lay.start[3]) * 0.45f)
+        startItm.view.text = "▶"
+        startItm.view.setOnClickListener { onStart() }
+        items.add(startItm)
 
         val hubD = lay.hub[2]
         val hub = makeItem(lay.hub[0], lay.hub[1], hubD, hubD, Color.argb(235, 24, 30, 36), hubD * 0.34f)

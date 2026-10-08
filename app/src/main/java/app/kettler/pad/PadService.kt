@@ -20,11 +20,21 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.MediaPlayer
+import android.media.RingtoneManager
 import android.os.Build
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -55,6 +65,8 @@ class PadService : Service() {
         val CP: UUID = UUID.fromString("00002ad9-0000-1000-8000-00805f9b34fb")
         val DATA: UUID = UUID.fromString("00002acd-0000-1000-8000-00805f9b34fb")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        val ENV: UUID = UUID.fromString("0000181a-0000-1000-8000-00805f9b34fb")
+        val TEMP: UUID = UUID.fromString("00002a6e-0000-1000-8000-00805f9b34fb")
         const val CHANNEL = "pad"
     }
 
@@ -86,6 +98,17 @@ class PadService : Service() {
         if (key == "layout" || key == "size" || key == "alpha") {
             ui.removeCallbacks(rebuildRunnable)
             ui.postDelayed(rebuildRunnable, 200)
+        } else if (key == "limit") {
+            ui.post {
+                evalTemp()
+                refreshUi()
+            }
+        } else if (key == "taddr") {
+            ui.post {
+                tfails = 0
+                closeTemp()
+                scheduleTempReconnect(500)
+            }
         }
     }
 
@@ -106,6 +129,50 @@ class PadService : Service() {
             closeGatt()
             setState("OFF", "انتهت مهلة الاتصال — إعادة المحاولة")
             scheduleReconnect(1500)
+        }
+    }
+
+    // ---- motor temperature sensor (ESP32, BLE Environmental Sensing 0x181A / 0x2A6E) ----
+    private var tgatt: BluetoothGatt? = null
+    private var tstate = "OFF"
+    private var tfails = 0
+    private var tempC = Double.NaN
+    private var lastTempAt = 0L
+    private var overheat = false
+    private var alarmOn = false
+    private var stopTries = 0
+    private var player: MediaPlayer? = null
+    private var vib: Vibrator? = null
+    private var savedVol = -1
+    private val treconnectRun = Runnable { connectTemp() }
+    private val ttimeoutRun = Runnable {
+        if (running && tstate == "CONNECTING") {
+            closeTemp()
+            tfails++
+            scheduleTempReconnect(2000)
+        }
+    }
+    private val tickRun = object : Runnable {
+        override fun run() {
+            if (!running) return
+            if (!tempC.isNaN() && SystemClock.elapsedRealtime() - lastTempAt > 10000) {
+                tempC = Double.NaN
+                Toast.makeText(this@PadService, "توقفت قراءة حرارة المحرك", Toast.LENGTH_SHORT).show()
+                refreshUi()
+            }
+            ui.postDelayed(this, 3000)
+        }
+    }
+    private val stopRun = object : Runnable {
+        override fun run() {
+            if (!running || !overheat || stopTries >= 60) return
+            stopTries++
+            if (gatt != null && speed > 0.3) {
+                wanted = -1.0
+                requestControl()
+                enqueue { writeCp(byteArrayOf(0x08, 0x01)) }
+            }
+            ui.postDelayed(this, 2000)
         }
     }
 
@@ -141,6 +208,8 @@ class PadService : Service() {
         }
         rebuildPanel()
         connect()
+        scheduleTempReconnect(1500)
+        ui.postDelayed(tickRun, 3000)
         return START_NOT_STICKY
     }
 
@@ -158,6 +227,8 @@ class PadService : Service() {
         ui.removeCallbacksAndMessages(null)
         stopScan()
         closeGatt()
+        closeTemp()
+        stopAlarm()
         removeAllWindows()
         super.onDestroy()
     }
@@ -475,8 +546,218 @@ class PadService : Service() {
         }
     }
 
+    // =====================================================================
+    //  Motor temperature sensor + overheat protection
+    // =====================================================================
+    private fun scheduleTempReconnect(ms: Long) {
+        ui.removeCallbacks(treconnectRun)
+        if (running) ui.postDelayed(treconnectRun, ms)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectTemp() {
+        if (!running) return
+        ui.removeCallbacks(treconnectRun)
+        ui.removeCallbacks(ttimeoutRun)
+        val addr = prefs.getString("taddr", null) ?: return
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        if (adapter == null || !adapter.isEnabled) {
+            scheduleTempReconnect(4000)
+            return
+        }
+        closeTemp()
+        tstate = "CONNECTING"
+        tgatt = adapter.getRemoteDevice(addr).connectGatt(this, false, tempCallback, BluetoothDevice.TRANSPORT_LE)
+        ui.postDelayed(ttimeoutRun, 20000)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeTemp() {
+        val g = tgatt
+        tgatt = null
+        tstate = "OFF"
+        try {
+            g?.disconnect()
+            g?.close()
+        } catch (e: Exception) {
+        }
+    }
+
+    private val tempCallback = object : BluetoothGattCallback() {
+
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            ui.post {
+                if (g !== tgatt) return@post
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    try {
+                        g.discoverServices()
+                    } catch (e: Exception) {
+                    }
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    ui.removeCallbacks(ttimeoutRun)
+                    val was = tstate == "ON"
+                    closeTemp()
+                    tfails++
+                    if (was) {
+                        tempC = Double.NaN
+                        Toast.makeText(this@PadService, "انقطع حساس حرارة المحرك", Toast.LENGTH_LONG).show()
+                        refreshUi()
+                    }
+                    scheduleTempReconnect(2000)
+                }
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        @Suppress("DEPRECATION")
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            ui.post {
+                if (g !== tgatt) return@post
+                val c = g.getService(ENV)?.getCharacteristic(TEMP)
+                if (c == null) {
+                    Toast.makeText(this@PadService, "هذا الجهاز لا يرسل الحرارة", Toast.LENGTH_LONG).show()
+                    ui.removeCallbacks(ttimeoutRun)
+                    closeTemp()
+                    scheduleTempReconnect(10000)
+                    return@post
+                }
+                ui.removeCallbacks(ttimeoutRun)
+                tfails = 0
+                tstate = "ON"
+                g.setCharacteristicNotification(c, true)
+                val d = c.getDescriptor(CCCD)
+                if (d != null) {
+                    d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    g.writeDescriptor(d)
+                }
+            }
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            val v = value.copyOf()
+            ui.post { onTempBytes(v) }
+        }
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < 33) {
+                val raw = characteristic.value
+                if (raw != null) {
+                    val v = raw.copyOf()
+                    ui.post { onTempBytes(v) }
+                }
+            }
+        }
+    }
+
+    private fun onTempBytes(v: ByteArray) {
+        if (v.size < 2) return
+        val raw = ((v[1].toInt() shl 8) or (v[0].toInt() and 0xFF)).toShort().toInt()   // sint16, 0.01 C
+        tempC = raw / 100.0
+        lastTempAt = SystemClock.elapsedRealtime()
+        evalTemp()
+        refreshUi()
+    }
+
+    /** Danger check with a 3 degree hysteresis so the alarm does not flicker. */
+    private fun evalTemp() {
+        val limit = prefs.getInt("limit", 70)
+        if (limit <= 0) {
+            if (overheat) {
+                overheat = false
+                stopAlarm()
+            }
+            return
+        }
+        val t = tempC
+        if (t.isNaN()) return
+        if (!overheat && t >= limit) {
+            overheat = true
+            startAlarm()
+            emergencyStop()
+            updateNote("حرارة المحرك " + Math.round(t) + "° — أُوقفت المشاية")
+        } else if (overheat && t <= limit - 3) {
+            overheat = false
+            stopAlarm()
+            updateNote("عادت حرارة المحرك إلى الوضع الآمن")
+        }
+    }
+
+    private fun emergencyStop() {
+        stopTries = 0
+        ui.removeCallbacks(stopRun)
+        wanted = -1.0
+        if (gatt != null) {
+            requestControl()
+            enqueue { writeCp(byteArrayOf(0x08, 0x01)) }
+        }
+        ui.postDelayed(stopRun, 2000)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startAlarm() {
+        if (alarmOn) return
+        alarmOn = true
+        try {
+            vib = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            vib?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 700, 300), 0))
+        } catch (e: Exception) {
+        }
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            savedVol = am.getStreamVolume(AudioManager.STREAM_ALARM)
+            am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
+        } catch (e: Exception) {
+        }
+        try {
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val mp = MediaPlayer()
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            mp.setDataSource(this, uri)
+            mp.isLooping = true
+            mp.prepare()
+            mp.start()
+            player = mp
+        } catch (e: Exception) {
+            player = null
+        }
+    }
+
+    private fun stopAlarm() {
+        alarmOn = false
+        try {
+            vib?.cancel()
+        } catch (e: Exception) {
+        }
+        try {
+            player?.stop()
+            player?.release()
+        } catch (e: Exception) {
+        }
+        player = null
+        if (savedVol >= 0) {
+            try {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.setStreamVolume(AudioManager.STREAM_ALARM, savedVol, 0)
+            } catch (e: Exception) {
+            }
+            savedVol = -1
+        }
+    }
+
     // ---- button actions ----
     private fun onTap(n: Int) {
+        if (overheat) {
+            Toast.makeText(this, "حرارة المحرك مرتفعة — الأوامر موقوفة", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (gatt == null) {
             Toast.makeText(this, "غير متصل بالمشاية", Toast.LENGTH_SHORT).show()
             return
@@ -489,6 +770,10 @@ class PadService : Service() {
 
     // one button: request control (0x00), short pause, then start/resume (0x07)
     private fun onStart() {
+        if (overheat) {
+            Toast.makeText(this, "حرارة المحرك مرتفعة — الأوامر موقوفة", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (gatt == null) {
             Toast.makeText(this, "غير متصل بالمشاية", Toast.LENGTH_SHORT).show()
             return
@@ -615,8 +900,7 @@ class PadService : Service() {
         return lp
     }
 
-    private fun makeItem(rx: Int, ry: Int, w: Int, h: Int, fill: Int, textPx: Float): Item {
-        val tv = TextView(this)
+    private fun makeItem(rx: Int, ry: Int, w: Int, h: Int, fill: Int, textPx: Float, tv: TextView = TextView(this)): Item {
         tv.gravity = Gravity.CENTER
         tv.setTextColor(Color.WHITE)
         tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx)
@@ -707,7 +991,7 @@ class PadService : Service() {
         items.add(startItm)
 
         val hubD = lay.hub[2]
-        val hub = makeItem(lay.hub[0], lay.hub[1], hubD, hubD, Color.argb(235, 24, 30, 36), hubD * 0.34f)
+        val hub = makeItem(lay.hub[0], lay.hub[1], hubD, hubD, Color.argb(235, 24, 30, 36), hubD * 0.34f, HubView(this))
         hubItem = hub
         attachDrag(hub)
 
@@ -787,7 +1071,7 @@ class PadService : Service() {
         }
         val tapRun = Runnable {
             pendingTap = false
-            toggle()
+            if (alarmOn) stopAlarm() else toggle()
         }
         hub.view.setOnTouchListener { _, e ->
             when (e.action) {
@@ -856,7 +1140,7 @@ class PadService : Service() {
             val on = live && Math.abs(speed - n) < 0.5
             x.bg.setStroke(if (on) dp(3) else 0, Color.WHITE)
         }
-        val ring = when (state) {
+        val ring = if (overheat) Color.rgb(231, 76, 60) else when (state) {
             "READY" -> Color.rgb(46, 204, 113)
             "ON" -> Color.rgb(52, 152, 219)
             "CONNECTING" -> Color.rgb(241, 196, 15)
@@ -864,5 +1148,79 @@ class PadService : Service() {
         }
         h.bg.setStroke(dp(3), ring)
         h.view.text = hubText()
+        h.view.invalidate()
+    }
+
+    /** The hub: speed in the middle, motor temperature 0..100 as a gauge around the rim. */
+    private inner class HubView(c: Context) : TextView(c) {
+        private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val tick = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val pill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.argb(235, 0, 0, 0)
+        }
+        private val num = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        private val box = RectF()
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val aw = Math.max(dp(3).toFloat(), w * 0.05f)
+            val r = w / 2f - dp(3) - aw / 2f - dp(1)
+            if (r <= 0f) return
+            val cx = w / 2f
+            val cy = height / 2f
+            box.set(cx - r, cy - r, cx + r, cy + r)
+            track.strokeWidth = aw
+            track.color = Color.argb(90, 255, 255, 255)
+            canvas.drawArc(box, 135f, 270f, false, track)
+
+            val limit = prefs.getInt("limit", 70)
+            if (limit in 1..100) {
+                val a = Math.toRadians(135.0 + 270.0 * limit / 100.0)
+                tick.strokeWidth = dp(2).toFloat()
+                tick.color = Color.rgb(255, 80, 80)
+                val r1 = r - aw
+                val r2 = r + aw
+                canvas.drawLine(
+                    cx + (r1 * Math.cos(a)).toFloat(), cy + (r1 * Math.sin(a)).toFloat(),
+                    cx + (r2 * Math.cos(a)).toFloat(), cy + (r2 * Math.sin(a)).toFloat(), tick
+                )
+            }
+
+            val t = tempC
+            if (t.isNaN()) return
+            val f = (t / 100.0).coerceIn(0.0, 1.0).toFloat()
+            arc.strokeWidth = aw
+            arc.color = when {
+                limit in 1..100 && t >= limit -> Color.rgb(231, 76, 60)
+                limit in 1..100 && t >= limit * 0.8 -> Color.rgb(241, 196, 15)
+                else -> Color.rgb(46, 204, 113)
+            }
+            if (f > 0f) canvas.drawArc(box, 135f, 270f * f, false, arc)
+
+            val ang = Math.toRadians(135.0 + 270.0 * f)
+            num.textSize = Math.max(dp(9).toFloat(), w * 0.15f)
+            val s = Math.round(t).toString()
+            val tw = num.measureText(s)
+            val th = num.textSize
+            val hw = tw / 2f + dp(2)
+            val hh = th / 2f + dp(1)
+            val tx = (cx + r * Math.cos(ang)).toFloat().coerceIn(hw, w - hw)
+            val ty = (cy + r * Math.sin(ang)).toFloat().coerceIn(hh, height - hh)
+            canvas.drawRoundRect(tx - hw, ty - hh, tx + hw, ty + hh, hh, hh, pill)
+            canvas.drawText(s, tx, ty + th * 0.35f, num)
+        }
     }
 }

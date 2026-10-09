@@ -65,8 +65,8 @@ class PadService : Service() {
         val CP: UUID = UUID.fromString("00002ad9-0000-1000-8000-00805f9b34fb")
         val DATA: UUID = UUID.fromString("00002acd-0000-1000-8000-00805f9b34fb")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        val ENV: UUID = UUID.fromString("0000181a-0000-1000-8000-00805f9b34fb")
-        val TEMP: UUID = UUID.fromString("00002a6e-0000-1000-8000-00805f9b34fb")
+        val NUS: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+        val NUS_TX: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
         const val CHANNEL = "pad"
     }
 
@@ -132,10 +132,12 @@ class PadService : Service() {
         }
     }
 
-    // ---- motor temperature sensor (ESP32, BLE Environmental Sensing 0x181A / 0x2A6E) ----
+    // ---- motor temperature sensor (ESP32, Nordic UART TX notifications, text like "Temp: 26.44 C") ----
     private var tgatt: BluetoothGatt? = null
     private var tstate = "OFF"
     private var tfails = 0
+    private var tconnectedAt = 0L
+    private var tscanCb: ScanCallback? = null
     private var tempC = Double.NaN
     private var lastTempAt = 0L
     private var overheat = false
@@ -144,21 +146,32 @@ class PadService : Service() {
     private var player: MediaPlayer? = null
     private var vib: Vibrator? = null
     private var savedVol = -1
+    private val numRe = Regex("-?\\d+(?:\\.\\d+)?")
     private val treconnectRun = Runnable { connectTemp() }
     private val ttimeoutRun = Runnable {
-        if (running && tstate == "CONNECTING") {
+        if (running && tstate != "ON") {
             closeTemp()
             tfails++
-            scheduleTempReconnect(2000)
+            scheduleTempReconnect(tempBackoff())
         }
     }
     private val tickRun = object : Runnable {
         override fun run() {
             if (!running) return
-            if (!tempC.isNaN() && SystemClock.elapsedRealtime() - lastTempAt > 10000) {
+            val hasSensor = prefs.getString("taddr", null) != null
+            val stale = SystemClock.elapsedRealtime() - lastTempAt > 10000
+            if (!tempC.isNaN() && stale) {
                 tempC = Double.NaN
-                Toast.makeText(this@PadService, "توقفت قراءة حرارة المحرك", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@PadService, "توقفت قراءة حرارة المحرك — إعادة الاتصال", Toast.LENGTH_SHORT).show()
                 refreshUi()
+            }
+            if (hasSensor && tstate == "ON" && stale && SystemClock.elapsedRealtime() - tconnectedAt > 12000) {
+                // connected but silent: drop it and reconnect
+                closeTemp()
+                tfails++
+                scheduleTempReconnect(500)
+            } else if (hasSensor && tstate == "OFF") {
+                scheduleTempReconnect(500)
             }
             ui.postDelayed(this, 3000)
         }
@@ -228,6 +241,7 @@ class PadService : Service() {
         stopScan()
         closeGatt()
         closeTemp()
+        stopTempScan()
         stopAlarm()
         removeAllWindows()
         super.onDestroy()
@@ -292,7 +306,6 @@ class PadService : Service() {
             return
         }
         closeGatt()
-        // after several failures the address may have changed: look for the saved name
         if (fails >= 3 && fails % 3 == 0 && scanCb == null) {
             findByName(adapter.bluetoothLeScanner)
         }
@@ -307,8 +320,11 @@ class PadService : Service() {
         if (!running) return
         fails = 0
         stopScan()
-        Toast.makeText(this, "جارٍ الاتصال بالمشاية...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "جارٍ الاتصال بالمشاية والحساس...", Toast.LENGTH_SHORT).show()
         connect()
+        tfails = 0
+        closeTemp()
+        scheduleTempReconnect(300)
     }
 
     @SuppressLint("MissingPermission")
@@ -554,6 +570,49 @@ class PadService : Service() {
         if (running) ui.postDelayed(treconnectRun, ms)
     }
 
+    /** 1s, 2s, 3s ... up to 5s between attempts: fast enough to catch the sensor, gentle on the battery. */
+    private fun tempBackoff(): Long = Math.min(5000L, 1000L + 1000L * Math.min(tfails, 4))
+
+    /** If the sensor's address changed, find it again by its saved name. */
+    @SuppressLint("MissingPermission")
+    private fun findTempByName() {
+        if (tscanCb != null) return
+        val want = prefs.getString("tname", null) ?: return
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter ?: return
+        val scanner = adapter.bluetoothLeScanner ?: return
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val nm = result.scanRecord?.deviceName ?: try { result.device.name } catch (e: Exception) { null }
+                if (nm != null && nm.equals(want, ignoreCase = true)) {
+                    val a = result.device.address
+                    ui.post {
+                        stopTempScan()
+                        if (a != prefs.getString("taddr", null)) {
+                            prefs.edit().putString("taddr", a).apply()
+                        }
+                    }
+                }
+            }
+        }
+        tscanCb = cb
+        try {
+            scanner.startScan(null, ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), cb)
+            ui.postDelayed({ stopTempScan() }, 8000)
+        } catch (e: Exception) {
+            tscanCb = null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopTempScan() {
+        val cb = tscanCb ?: return
+        tscanCb = null
+        try {
+            (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter?.bluetoothLeScanner?.stopScan(cb)
+        } catch (e: Exception) {
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun connectTemp() {
         if (!running) return
@@ -566,9 +625,10 @@ class PadService : Service() {
             return
         }
         closeTemp()
+        if (tfails >= 4 && tfails % 4 == 0) findTempByName()
         tstate = "CONNECTING"
         tgatt = adapter.getRemoteDevice(addr).connectGatt(this, false, tempCallback, BluetoothDevice.TRANSPORT_LE)
-        ui.postDelayed(ttimeoutRun, 20000)
+        ui.postDelayed(ttimeoutRun, 12000)
     }
 
     @SuppressLint("MissingPermission")
@@ -604,7 +664,7 @@ class PadService : Service() {
                         Toast.makeText(this@PadService, "انقطع حساس حرارة المحرك", Toast.LENGTH_LONG).show()
                         refreshUi()
                     }
-                    scheduleTempReconnect(2000)
+                    scheduleTempReconnect(if (was) 500L else tempBackoff())
                 }
             }
         }
@@ -614,16 +674,19 @@ class PadService : Service() {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             ui.post {
                 if (g !== tgatt) return@post
-                val c = g.getService(ENV)?.getCharacteristic(TEMP)
+                val c = g.getService(NUS)?.getCharacteristic(NUS_TX)
                 if (c == null) {
-                    Toast.makeText(this@PadService, "هذا الجهاز لا يرسل الحرارة", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@PadService, "هذا الجهاز لا يرسل الحرارة (Nordic UART)", Toast.LENGTH_LONG).show()
                     ui.removeCallbacks(ttimeoutRun)
                     closeTemp()
+                    tfails++
                     scheduleTempReconnect(10000)
                     return@post
                 }
                 ui.removeCallbacks(ttimeoutRun)
                 tfails = 0
+                tconnectedAt = SystemClock.elapsedRealtime()
+                lastTempAt = tconnectedAt
                 tstate = "ON"
                 g.setCharacteristicNotification(c, true)
                 val d = c.getDescriptor(CCCD)
@@ -651,10 +714,13 @@ class PadService : Service() {
         }
     }
 
+    /** Text such as "Temp: 26.44 C": take the first number in the message. */
     private fun onTempBytes(v: ByteArray) {
-        if (v.size < 2) return
-        val raw = ((v[1].toInt() shl 8) or (v[0].toInt() and 0xFF)).toShort().toInt()   // sint16, 0.01 C
-        tempC = raw / 100.0
+        val txt = try { String(v, Charsets.UTF_8) } catch (e: Exception) { return }
+        val m = numRe.find(txt) ?: return
+        val t = m.value.toDoubleOrNull() ?: return
+        if (t < -50.0 || t > 250.0) return
+        tempC = t
         lastTempAt = SystemClock.elapsedRealtime()
         evalTemp()
         refreshUi()
@@ -1104,7 +1170,6 @@ class PadService : Service() {
                     ui.removeCallbacks(longRun)
                     if (!moved && !longFired) {
                         if (pendingTap) {
-                            // second tap: remove the circle completely
                             ui.removeCallbacks(tapRun)
                             pendingTap = false
                             Toast.makeText(this, "أُغلقت اللوحة", Toast.LENGTH_SHORT).show()

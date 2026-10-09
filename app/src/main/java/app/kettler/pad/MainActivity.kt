@@ -40,7 +40,7 @@ class MainActivity : Activity() {
     private var scanning = false
     private var scanCb: ScanCallback? = null
     private val ftms: UUID = UUID.fromString("00001826-0000-1000-8000-00805f9b34fb")
-    private val env: UUID = UUID.fromString("0000181a-0000-1000-8000-00805f9b34fb")
+    private val nus: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
     private var forTemp = false
 
     private val stateListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -275,9 +275,10 @@ class MainActivity : Activity() {
                 val uuids = rec?.serviceUuids
                 if (uuids != null) {
                     for (u in uuids) {
-                        if (u.uuid == (if (forTemp) env else ftms)) isFtms = true
+                        if (u.uuid == (if (forTemp) nus else ftms)) isFtms = true
                     }
                 }
+                if (forTemp && name.contains("SENSOR", ignoreCase = true)) isFtms = true
                 addDevice(addr, name, isFtms)
             }
         }
